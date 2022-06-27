@@ -1,5 +1,7 @@
 import os
 import sys
+
+from cv2 import VideoWriter
 base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(base_path)
 
@@ -16,8 +18,8 @@ import glob
 import math
 
 arch = ti.vulkan if ti._lib.core.with_vulkan() else ti.cuda
-arch = ti.cpu
-ti.init(arch=arch, random_seed=5) # device_memory_fraction=0.8
+# arch = ti.cpu
+ti.init(arch=arch, random_seed=5, kernel_profiler=True) # device_memory_fraction=0.8
 
 dtype_f_np = np.float32
 real = ti.f32
@@ -109,10 +111,8 @@ class Linear:
 		self.n_output = n_output
 		self.activation = activation
 
-		self.hidden = scalar()
 		self.output = scalar()
 
-		ti.root.dense(ti.ij, (self.batch_size, self.n_output)).place(self.hidden) # [batch_size, n_hidden]
 		ti.root.dense(ti.ij, (self.batch_size, self.n_output)).place(self.output) # [batch_size, n_output]
 
 		self.weights1 = scalar()
@@ -137,26 +137,26 @@ class Linear:
 			self.weights1[i, j] = (ti.random() * 2 - 1) * q1
 
 	@ti.kernel
-	def _forward(self, t: ti.i32, nn_input: ti.template()):
-		for k, i, j in ti.ndrange(self.batch_size, self.n_output, self.n_input):
-			self.hidden[k, i] += self.weights1[i,j] * nn_input[t, k, j]
+	def _forward(self, nn_input: ti.template()):
+		for k, i, j in ti.ndrange(self.batch_size // 4, self.n_output, self.n_input):
+			for l in ti.static(range(4)):
+				base = 4*k
+				self.output[base + l, i] += self.weights1[i,j] * nn_input[base + l, j]
 		
 		if ti.static(self.activation):
 			for k, i in ti.ndrange(self.batch_size, self.n_output):
-				self.output[k, i] = ti.max(self.hidden[k, i] + self.bias1[i], 0)
+				self.output[k, i] = ti.max(self.output[k, i] + self.bias1[i], 0)
 		else:
 			for k, i in ti.ndrange(self.batch_size, self.n_output):
-				self.output[k, i] = self.hidden[k, i] + self.bias1[i]
+				self.output[k, i] = self.output[k, i] + self.bias1[i]
 
 	@ti.kernel
 	def clear(self):
-		for I in ti.grouped(self.hidden):
-			self.hidden[I] = 0.
 		for I in ti.grouped(self.output):
 			self.output[I] = 0.
 
-	def forward(self, t, nn_input):
-		self._forward(t, nn_input)
+	def forward(self, nn_input):
+		self._forward(nn_input)
 
 	def dump_weights(self, name="save.pkl"):
 		w_val = []
@@ -230,19 +230,20 @@ def init_embeddings():
 	pass
 
 def init_nn_model(config): 
-	global BATCH_SIZE, rays_o, rays_d, viewdirs, pts, target, fc1, fc2
-	global loss
+	global BATCH_SIZE, rays_o, rays_d, viewdirs, pts, target
+	global loss, primes_1
 	global optimizer
 	global bounding_box, logspace, N_samples, z_vals
 	global n_levels, n_features_per_level, base_resolution, log2_hashmap_size, finest_resolution
-	global resolutions, embeddings, mlp_input, grid_size
+	global resolutions, embeddings, sigma_input, color_input, grid_size, box_offsets
+	global sigma_output, last_color
+	global sigma1, sigma2, color1, color2, color3
 
-	n_input = 3
-	n_output = 16
-	n_output_act = 3
 	learning_rate = 1e-2
 	N_samples = 128
-	
+	hidden = 64
+
+
 	n_levels = 16
 	n_features_per_level = 2
 	base_resolution = 16
@@ -251,7 +252,7 @@ def init_nn_model(config):
 	hash_b = math.exp((math.log(finest_resolution) - math.log(base_resolution)) / (n_levels-1))
 	
 
-	BATCH_SIZE = 4096
+	BATCH_SIZE = 1024
 	rays_o = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
 	rays_d = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
 	viewdirs = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
@@ -261,11 +262,20 @@ def init_nn_model(config):
 	pts = ti.Vector.field(3, dtype=float, shape=(BATCH_SIZE * N_samples))
 	resolutions = ti.field(float, shape=n_levels)
 	grid_size = ti.Vector.field(3, dtype=float, shape=n_levels)
-	mlp_input = ti.field(float, shape=(BATCH_SIZE * N_samples, n_features_per_level * n_levels + 16))
+	box_offsets = ti.Vector.field(3, dtype=int, shape=8)
+	
+	sigma_input = ti.field(float, shape=(BATCH_SIZE * N_samples, n_features_per_level * n_levels))
+	color_input = ti.field(float, shape=(BATCH_SIZE * N_samples, 31)) # 15 + 16
+	sigma_output = ti.field(float, shape=(BATCH_SIZE * N_samples))
+
+	last_color = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
 	target = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
-	embeddings = ti.Vector.field(n_features_per_level, dtype=float, shape=(n_levels, 2 ** log2_hashmap_size))
+
+	embeddings = ti.Vector.field(n_features_per_level, dtype=float, shape=(n_levels, 2 ** log2_hashmap_size), needs_grad=True)
 	
 	loss = ti.field(float, shape=(), needs_grad=True)
+	primes_1 = ti.field(ti.i64, shape=())
+	primes_1[None] = 2654435761
 
 	bounding_box_np = np.array([[-5, -5, -5], [5, 5, 2]], dtype=np.float32)
 	bounding_box.from_numpy(bounding_box_np)
@@ -273,29 +283,52 @@ def init_nn_model(config):
 	logspace_np = np.linspace(0., 1., num=N_samples+1, dtype=np.float32)
 	logspace.from_numpy(logspace_np)
 	
-	resolutions_np = [np.floor(base_resolution * (hash_b **i)) for i in range(n_levels)]
+	resolutions_np = np.array([np.floor(base_resolution * (hash_b **i)) for i in range(n_levels)], dtype=np.float32)
 	resolutions.from_numpy(resolutions_np)
 
 	grid_size_np = (bounding_box_np[1:] - bounding_box_np[0:1]) / np.expand_dims(resolutions_np, axis=1) # 16,3
 	grid_size.from_numpy(grid_size_np)
 
+	box_offsets_np = np.array([[[i,j,k] for i in [0, 1] for j in [0, 1] for k in [0, 1]]], dtype = np.int32)
+	box_offsets.from_numpy(box_offsets_np)
+
 	# init embeddings
 	# uniform_
 	init_embeddings()
 
-	fc1 = Linear(batch_size=BATCH_SIZE,
-					n_input=n_input,
-					n_output=n_output,
-					needs_grad=True,
-					activation=False)
-	fc2 = Linear(batch_size=BATCH_SIZE,
-					n_input=n_output,
-					n_output=n_output_act,
+	sigma1 = Linear(batch_size=BATCH_SIZE * N_samples,
+					n_input = n_features_per_level * n_levels,
+					n_output = hidden,
 					needs_grad=True,
 					activation=True)
-	fc1.weights_init()
-	fc2.weights_init()
-	NNs = [fc1, fc2]
+	sigma2 = Linear(batch_size = BATCH_SIZE * N_samples,
+					n_input = hidden,
+					n_output= 16,
+					needs_grad=True,
+					activation=False)
+	color1 = Linear(batch_size=BATCH_SIZE * N_samples,
+					n_input= 15 + 16,
+					n_output = hidden,
+					needs_grad=True,
+					activation=True)
+	color2 = Linear(batch_size=BATCH_SIZE * N_samples,
+					n_input = hidden,
+					n_output = hidden,
+					needs_grad=True,
+					activation=True)
+	color3 = Linear(batch_size=BATCH_SIZE * N_samples,
+					n_input= hidden,
+					n_output = 3,
+					needs_grad=True,
+					activation=False)
+
+	sigma1.weights_init()
+	sigma2.weights_init()
+	color1.weights_init()
+	color2.weights_init()
+	color3.weights_init()
+
+	NNs = [sigma1, sigma2, color1, color2, color3]
 	parameters = []
 	for layer in NNs:
 		parameters.extend(layer.parameters())
@@ -350,48 +383,133 @@ def get_pts():
 		get_pts_func(idx)
 
 
+@ti.kernel
+def tail_deal_sigma():
+	for idx in range(BATCH_SIZE * N_samples):
+		sigma_output[idx] = sigma2.output[idx, 0]
+
+		for i in range(1, 16):
+			color_input[idx, i-1] = sigma2.output[idx, i]
+
 primes_0 = 1
-primes_1 = 2654435761
 primes_2 = 805459861
 
 @ti.func
 def hash(v):
-	pass
+	xor_result = v[0] ^ (v[1] * primes_1[None])
+	xor_result = xor_result ^ (v[2] * primes_2)
+	return ti.cast(((1<<log2_hashmap_size) - 1) & xor_result, ti.i32)
 
 
 @ti.func
 def per_level_fill(idx, level):
 	# cal 8 hash index
-	bottom_left_idx = ti.floor((pts[idx] - bounding_box[0]) / grid_size[level])
-	bottom_left_idx = bottom_left_idx.cast(ti.i32) # 3
-
-	# 0
+	bottom_left_idx = ti.cast(ti.floor((pts[idx] - bounding_box[0]) / grid_size[level]), ti.i32)
 	
+	# hash 0
+	hash_0 = hash(bottom_left_idx) # int
+
 	# 1
+	hash_1 = hash(bottom_left_idx + box_offsets[1])
 
 	# 2
+	hash_2 = hash(bottom_left_idx + box_offsets[2])
 
 	# 3
+	hash_3 = hash(bottom_left_idx + box_offsets[3])
 
 	# 4
+	hash_4 = hash(bottom_left_idx + box_offsets[4])
 
 	# 5
+	hash_5 = hash(bottom_left_idx + box_offsets[5])
 
 	# 6
+	hash_6 = hash(bottom_left_idx + box_offsets[6])
 
 	# 7
+	hash_7 = hash(bottom_left_idx + box_offsets[7])
 
+	voxel_min_vertex = bottom_left_idx * grid_size[level] + bounding_box[0] # 3
 
+	# interpolate according to indexes
+	weights = (pts[idx] - voxel_min_vertex) / grid_size[level]
 
-	# interpolate
+	# step1
+	c00 = embeddings[level, hash_0] * (1-weights[0]) + embeddings[level, hash_4] * weights[0]
+	c01 = embeddings[level, hash_1] * (1-weights[0]) + embeddings[level, hash_5] * weights[0]
+	c10 = embeddings[level, hash_2] * (1-weights[0]) + embeddings[level, hash_6] * weights[0]
+	c11 = embeddings[level, hash_3] * (1-weights[0]) + embeddings[level, hash_7] * weights[0]
 
+    # step 2
+	c0 = c00 * (1-weights[1]) + c10 * weights[1]
+	c1 = c01 * (1-weights[1]) + c11 * weights[1]
+
+	# step 3
+	c = c0 * (1-weights[2]) + c1 * weights[2]
+
+	return c
 
 
 @ti.kernel
 def fill_inputs():
 	tot = N_samples * BATCH_SIZE * n_levels
 	for i in range(tot):
-		per_level_fill(tot // n_levels, tot % n_levels)
+		level = i % n_levels
+		idx = i // n_levels
+		c = per_level_fill(idx, level)
+		# write to input
+		base = level * n_features_per_level
+		for j in ti.static(range(n_features_per_level)):
+			sigma_input[idx, base + j] = c[j]
+
+
+C0 = 0.28209479177387814
+C1 = 0.4886025119029199
+C2 = [
+	1.0925484305920792,
+	-1.0925484305920792,
+	0.31539156525252005,
+	-1.0925484305920792,
+	0.5462742152960396
+]
+C3 = [
+	-0.5900435899266435,
+	2.890611442640554,
+	-0.4570457994644658,
+	0.3731763325901154,
+	-0.4570457994644658,
+	1.445305721320277,
+	-0.5900435899266435
+]
+
+@ti.kernel
+def fill_views():
+	base = 15
+	for idx in range(N_samples * BATCH_SIZE):
+		batch_idx = idx // N_samples
+		x = viewdirs[batch_idx][0]
+		y = viewdirs[batch_idx][1]
+		z = viewdirs[batch_idx][2]
+
+		color_input[idx, base] = C0
+		color_input[idx, base + 1] = -C1 * y
+		color_input[idx, base + 2] = C1 * z
+		color_input[idx, base + 3] = -C1 * x
+		xx, yy, zz = x * x, y * y, z * z
+		xy, yz, xz = x * y, y * z, x * z
+		color_input[idx, base + 4] = C2[0] * xy
+		color_input[idx, base + 5] = C2[1] * yz
+		color_input[idx, base + 6] = C2[2] * (2.0 * zz - xx - yy)
+		color_input[idx, base + 7] = C2[3] * xz
+		color_input[idx, base + 8] = C2[4] * (xx - yy)
+		color_input[idx, base + 9] = C3[0] * y * (3 * xx - yy)
+		color_input[idx, base + 10] = C3[1] * xy * z
+		color_input[idx, base + 11] = C3[2] * y * (4 * zz - xx - yy)
+		color_input[idx, base + 12] = C3[3] * z * (2 * zz - 3 * xx - 3 * yy)
+		color_input[idx, base + 13] = C3[4] * x * (4 * zz - xx - yy)
+		color_input[idx, base + 14] = C3[5] * z * (xx - yy)
+		color_input[idx, base + 15] = C3[6] * x * (xx - 3 * yy)
 
 
 def parse_args():
@@ -451,19 +569,21 @@ def main(timestamp):
 			fill_inputs()
 
 			# fill viewdirs encoding for mlp
+			fill_views()
 
-			# use features and viewdirs to get weights
+			# cal weights using linears
+			sigma1.forward(sigma_input)
+			sigma2.forward(sigma1.output)
 
-			# use weights to get fine net's points
+			tail_deal_sigma() # sigma_output: [bn, ]
 
-			# hash points to index to get training features (mlp's input) and corresponding indexs
+			color1.forward(color_input)
+			color2.forward(color1.output)
+			color3.forward(color2.output)
+			# color3.output:  [bn, 3]
 
-			# fill encoding for viewdirs
+			ti.profiler.print_kernel_profiler_info()  
 
-			
-
-			fc1.clear()
-			fc2.clear()
 			with ti.Tape(loss=loss):
 				# use features and viewdirs to get weights
 
