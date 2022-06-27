@@ -230,12 +230,12 @@ def init_embeddings():
 	pass
 
 def init_nn_model(config): 
-	global BATCH_SIZE, rays_o, rays_d, viewdirs, pts, target, fc1, fc2, list_hash_table
+	global BATCH_SIZE, rays_o, rays_d, viewdirs, pts, target, fc1, fc2
 	global loss
 	global optimizer
 	global bounding_box, logspace, N_samples, z_vals
 	global n_levels, n_features_per_level, base_resolution, log2_hashmap_size, finest_resolution
-	global hash_b, hashmap
+	global resolutions, embeddings, mlp_input, grid_size
 
 	n_input = 3
 	n_output = 16
@@ -249,6 +249,7 @@ def init_nn_model(config):
 	log2_hashmap_size = 19
 	finest_resolution = 1024
 	hash_b = math.exp((math.log(finest_resolution) - math.log(base_resolution)) / (n_levels-1))
+	
 
 	BATCH_SIZE = 4096
 	rays_o = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
@@ -258,14 +259,12 @@ def init_nn_model(config):
 	logspace = ti.field(float, shape=N_samples+1)
 	z_vals = ti.field(float, shape=(BATCH_SIZE, N_samples))
 	pts = ti.Vector.field(3, dtype=float, shape=(BATCH_SIZE * N_samples))
-	# 对于每个三维点，需要16个level上的索引
-	indexs = ti.Vector.field(8, dtype=int, shape=(BATCH_SIZE * N_samples, n_levels)) # [BN, 16, 8] 
-	# 此外还需要一些信息来插值
-	# [BN, ]
-
+	resolutions = ti.field(float, shape=n_levels)
+	grid_size = ti.Vector.field(3, dtype=float, shape=n_levels)
 	mlp_input = ti.field(float, shape=(BATCH_SIZE * N_samples, n_features_per_level * n_levels + 16))
 	target = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
 	embeddings = ti.Vector.field(n_features_per_level, dtype=float, shape=(n_levels, 2 ** log2_hashmap_size))
+	
 	loss = ti.field(float, shape=(), needs_grad=True)
 
 	bounding_box_np = np.array([[-5, -5, -5], [5, 5, 2]], dtype=np.float32)
@@ -274,6 +273,12 @@ def init_nn_model(config):
 	logspace_np = np.linspace(0., 1., num=N_samples+1, dtype=np.float32)
 	logspace.from_numpy(logspace_np)
 	
+	resolutions_np = [np.floor(base_resolution * (hash_b **i)) for i in range(n_levels)]
+	resolutions.from_numpy(resolutions_np)
+
+	grid_size_np = (bounding_box_np[1:] - bounding_box_np[0:1]) / np.expand_dims(resolutions_np, axis=1) # 16,3
+	grid_size.from_numpy(grid_size_np)
+
 	# init embeddings
 	# uniform_
 	init_embeddings()
@@ -345,10 +350,48 @@ def get_pts():
 		get_pts_func(idx)
 
 
+primes_0 = 1
+primes_1 = 2654435761
+primes_2 = 805459861
+
+@ti.func
+def hash(v):
+	pass
+
+
+@ti.func
+def per_level_fill(idx, level):
+	# cal 8 hash index
+	bottom_left_idx = ti.floor((pts[idx] - bounding_box[0]) / grid_size[level])
+	bottom_left_idx = bottom_left_idx.cast(ti.i32) # 3
+
+	# 0
+	
+	# 1
+
+	# 2
+
+	# 3
+
+	# 4
+
+	# 5
+
+	# 6
+
+	# 7
+
+
+
+	# interpolate
+
+
+
 @ti.kernel
-def get_index():
-	for idx in range(BATCH_SIZE):
-		pass
+def fill_inputs():
+	tot = N_samples * BATCH_SIZE * n_levels
+	for i in range(tot):
+		per_level_fill(tot // n_levels, tot % n_levels)
 
 
 def parse_args():
@@ -404,8 +447,8 @@ def main(timestamp):
 			# cal points for each ray
 			get_pts()
 
-			# get index and min,max vertex for interpolate
-			get_index()
+			# get index and interpolate to fill
+			fill_inputs()
 
 			# fill viewdirs encoding for mlp
 
