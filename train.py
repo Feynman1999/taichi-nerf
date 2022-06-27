@@ -1,7 +1,6 @@
 import os
 import sys
 
-from cv2 import VideoWriter
 base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(base_path)
 
@@ -19,7 +18,7 @@ import math
 
 arch = ti.vulkan if ti._lib.core.with_vulkan() else ti.cuda
 # arch = ti.cpu
-ti.init(arch=arch, random_seed=5, kernel_profiler=True) # device_memory_fraction=0.8
+ti.init(arch=arch, random_seed=5) # device_memory_fraction=0.8
 
 dtype_f_np = np.float32
 real = ti.f32
@@ -227,7 +226,8 @@ def init_data(root_path, para_path):
 
 @ti.kernel
 def init_embeddings():
-	pass
+	for i,j in ti.ndrange(n_levels, 2 ** log2_hashmap_size):
+		embeddings[i, j] = (ti.random(dtype=float) * 0.0002 - 0.0001)
 
 def init_nn_model(config): 
 	global BATCH_SIZE, rays_o, rays_d, viewdirs, pts, target
@@ -252,32 +252,34 @@ def init_nn_model(config):
 	hash_b = math.exp((math.log(finest_resolution) - math.log(base_resolution)) / (n_levels-1))
 	
 
-	BATCH_SIZE = 1024
-	rays_o = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
-	rays_d = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
-	viewdirs = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
+	BATCH_SIZE = 4096
 	bounding_box = ti.Vector.field(3, dtype=float, shape=2)
 	logspace = ti.field(float, shape=N_samples+1)
-	z_vals = ti.field(float, shape=(BATCH_SIZE, N_samples))
-	pts = ti.Vector.field(3, dtype=float, shape=(BATCH_SIZE * N_samples))
 	resolutions = ti.field(float, shape=n_levels)
 	grid_size = ti.Vector.field(3, dtype=float, shape=n_levels)
 	box_offsets = ti.Vector.field(3, dtype=int, shape=8)
 	
-	sigma_input = ti.field(float, shape=(BATCH_SIZE * N_samples, n_features_per_level * n_levels))
+	rays_o = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
+	rays_d = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
+	viewdirs = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
+	
+	z_vals = ti.field(float, shape=(BATCH_SIZE, N_samples))
+	pts = ti.Vector.field(3, dtype=float, shape=(BATCH_SIZE * N_samples))
+	
+	sigma_input = ti.field(float, shape=(BATCH_SIZE * N_samples, n_features_per_level * n_levels)) # 32
 	color_input = ti.field(float, shape=(BATCH_SIZE * N_samples, 31)) # 15 + 16
 	sigma_output = ti.field(float, shape=(BATCH_SIZE * N_samples))
 
+	embeddings = ti.Vector.field(n_features_per_level, dtype=float, shape=(n_levels, 2 ** log2_hashmap_size), needs_grad=True)
+
 	last_color = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
 	target = ti.Vector.field(3, dtype=float, shape=BATCH_SIZE)
-
-	embeddings = ti.Vector.field(n_features_per_level, dtype=float, shape=(n_levels, 2 ** log2_hashmap_size), needs_grad=True)
-	
 	loss = ti.field(float, shape=(), needs_grad=True)
+
 	primes_1 = ti.field(ti.i64, shape=())
 	primes_1[None] = 2654435761
 
-	bounding_box_np = np.array([[-5, -5, -5], [5, 5, 2]], dtype=np.float32)
+	bounding_box_np = np.array([[-5, -5, -5], [5, 5, 1]], dtype=np.float32)
 	bounding_box.from_numpy(bounding_box_np)
 
 	logspace_np = np.linspace(0., 1., num=N_samples+1, dtype=np.float32)
@@ -329,9 +331,13 @@ def init_nn_model(config):
 	color3.weights_init()
 
 	NNs = [sigma1, sigma2, color1, color2, color3]
+	
 	parameters = []
 	for layer in NNs:
 		parameters.extend(layer.parameters())
+
+	parameters.append(embeddings)
+
 	optimizer = SGD(params=parameters, lr=learning_rate)
 
 
@@ -519,6 +525,7 @@ def parse_args():
 	args = parser.parse_args()
 	return args
 
+
 def main(timestamp):
 	args = parse_args()
 	cfg = Config.fromfile(args.config)
@@ -581,8 +588,6 @@ def main(timestamp):
 			color2.forward(color1.output)
 			color3.forward(color2.output)
 			# color3.output:  [bn, 3]
-
-			ti.profiler.print_kernel_profiler_info()  
 
 			with ti.Tape(loss=loss):
 				# use features and viewdirs to get weights
