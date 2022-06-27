@@ -227,7 +227,8 @@ def init_data(root_path, para_path):
 @ti.kernel
 def init_embeddings():
 	for i,j in ti.ndrange(n_levels, 2 ** log2_hashmap_size):
-		embeddings[i, j] = (ti.random(dtype=float) * 0.0002 - 0.0001)
+		for k in ti.static(range(n_features_per_level)):
+			embeddings[i, j][k] = (ti.random(dtype=float) * 0.0002 - 0.0001)
 
 def init_nn_model(config): 
 	global BATCH_SIZE, rays_o, rays_d, viewdirs, pts, target
@@ -236,7 +237,7 @@ def init_nn_model(config):
 	global bounding_box, logspace, N_samples, z_vals
 	global n_levels, n_features_per_level, base_resolution, log2_hashmap_size, finest_resolution
 	global resolutions, embeddings, sigma_input, color_input, grid_size, box_offsets
-	global sigma_output, last_color
+	global sigma_output, last_color, normalized_weight
 	global sigma1, sigma2, color1, color2, color3
 
 	learning_rate = 1e-2
@@ -269,6 +270,7 @@ def init_nn_model(config):
 	sigma_input = ti.field(float, shape=(BATCH_SIZE * N_samples, n_features_per_level * n_levels)) # 32
 	color_input = ti.field(float, shape=(BATCH_SIZE * N_samples, 31)) # 15 + 16
 	sigma_output = ti.field(float, shape=(BATCH_SIZE * N_samples))
+	normalized_weight = ti.field(float, shape=(BATCH_SIZE, N_samples))
 
 	embeddings = ti.Vector.field(n_features_per_level, dtype=float, shape=(n_levels, 2 ** log2_hashmap_size), needs_grad=True)
 
@@ -469,6 +471,31 @@ def fill_inputs():
 		for j in ti.static(range(n_features_per_level)):
 			sigma_input[idx, base + j] = c[j]
 
+@ti.func
+def raw2alpha(raw, dist):
+	before_exp = -ti.max(raw, 0) * dist
+	return 1.0 - ti.exp(before_exp)
+
+
+@ti.kernel
+def get_normalized_weight():
+	for idx in range(BATCH_SIZE):
+		# C = 0.0
+		T = 1.0
+		rays_d_norm = rays_d[idx].norm(eps = 1e-6)
+		# for points
+		for pj in range(N_samples-1):
+			z_vals_gap = z_vals[idx, pj+1] - z_vals[idx, pj]
+			mid = raw2alpha(sigma_output[idx * N_samples + pj], z_vals_gap * rays_d_norm)
+			normalized_weight[idx, pj] =  T * mid
+			# C += normalized_weight[idx, pj]
+			T = T * (1 - mid)
+
+		# dist 1e10
+		mid = raw2alpha(sigma_output[idx * N_samples + N_samples-1], 1e10 * rays_d_norm)
+		normalized_weight[idx, N_samples-1] = T * mid
+		# C += normalized_weight[idx, N_samples-1]
+
 
 C0 = 0.28209479177387814
 C1 = 0.4886025119029199
@@ -588,6 +615,9 @@ def main(timestamp):
 			color2.forward(color1.output)
 			color3.forward(color2.output)
 			# color3.output:  [bn, 3]
+
+			# do not render
+			get_normalized_weight()
 
 			with ti.Tape(loss=loss):
 				# use features and viewdirs to get weights
