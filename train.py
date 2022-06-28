@@ -18,7 +18,7 @@ import math
 
 arch = ti.vulkan if ti._lib.core.with_vulkan() else ti.cuda
 # arch = ti.cpu
-ti.init(arch=arch, random_seed=5) # device_memory_fraction=0.8
+ti.init(arch=arch, random_seed=5, device_memory_fraction=0.9) # device_memory_fraction=0.8
 
 dtype_f_np = np.float32
 real = ti.f32

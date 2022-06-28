@@ -71,11 +71,8 @@ test_cfg = dict(
     num_cols = 2)
 
 
-# root_path= r"E:\BaiduNetdiskDownload\test_a\test_a\F1_06\000060" #
-# para_path = r"E:\BaiduNetdiskDownload\camera_parameters\camera_parameters" # 
-
-root_path = r"/data/test_a/F1_06/000060"
-para_path = r"/home/chenyuxiang/repos/evaluation_code/camera_parameters"
+root_path= r"E:\BaiduNetdiskDownload\test_a\test_a\F1_06\000060" # r"/data/test_a/F1_06/000060"
+para_path = r"E:\BaiduNetdiskDownload\camera_parameters\camera_parameters" # "/home/chenyuxiang/repos/evaluation_code/camera_parameters"
 
 log_config = dict(
     interval=50000,
