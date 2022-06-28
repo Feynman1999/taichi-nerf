@@ -1,0 +1,17 @@
+*.so
+
+*.pyc
+
+.idea/
+
+/workdirs
+
+.vscode
+
+/log
+
+/core
+
+__pycache__/
+
+*.log

@@ -1,1 +1,1 @@
-rlaunch --cpu=4 --gpu=1 --memory=12960 -- python train.py mgtv_ngp.py
+python train.py mgtv_ngp.py
