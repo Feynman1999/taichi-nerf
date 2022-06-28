@@ -16,9 +16,9 @@ import cv2
 import glob
 import math
 
-arch = ti.vulkan if ti._lib.core.with_vulkan() else ti.cuda
+arch = ti.cuda
 # arch = ti.cpu
-ti.init(arch=arch, random_seed=5, device_memory_fraction=0.9) # device_memory_fraction=0.8
+ti.init(arch=arch, random_seed=5, device_memory_fraction=0.6) # device_memory_fraction=0.8
 
 dtype_f_np = np.float32
 real = ti.f32
@@ -229,6 +229,7 @@ def init_embeddings():
 	for i,j in ti.ndrange(n_levels, 2 ** log2_hashmap_size):
 		for k in ti.static(range(n_features_per_level)):
 			embeddings[i, j][k] = (ti.random(dtype=float) * 0.0002 - 0.0001)
+
 
 def init_nn_model(config): 
 	global BATCH_SIZE, rays_o, rays_d, viewdirs, pts, target
@@ -471,6 +472,7 @@ def fill_inputs():
 		for j in ti.static(range(n_features_per_level)):
 			sigma_input[idx, base + j] = c[j]
 
+
 @ti.func
 def raw2alpha(raw, dist):
 	before_exp = -ti.max(raw, 0) * dist
@@ -543,6 +545,11 @@ def fill_views():
 		color_input[idx, base + 13] = C3[4] * x * (4 * zz - xx - yy)
 		color_input[idx, base + 14] = C3[5] * z * (xx - yy)
 		color_input[idx, base + 15] = C3[6] * x * (xx - 3 * yy)
+
+
+@ti.kernel
+def sample_pdf():
+	pass
 
 
 def parse_args():
@@ -618,6 +625,9 @@ def main(timestamp):
 
 			# do not render
 			get_normalized_weight()
+
+			# sample pdf
+			sample_pdf()
 
 			with ti.Tape(loss=loss):
 				# use features and viewdirs to get weights
